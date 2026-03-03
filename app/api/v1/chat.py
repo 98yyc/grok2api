@@ -954,7 +954,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     "completion_tokens": usage_completion,
                     "total_tokens": usage_total,
                 }
+                # [NEW] 包含 post_id (取第一个结果的)
+                if results and results[0].get("post_id"):
+                    merged["post_id"] = results[0]["post_id"]
+                
                 result = merged
+
         except Exception as e:
             return _chat_error_as_success_response(request.model, _video_error_message(e))
     else:

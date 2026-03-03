@@ -994,7 +994,7 @@ class VideoStreamProcessor(BaseProcessor):
             logger.warning(f"Video upscale failed: {e}")
         return video_url
 
-    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
+    def _sse(self, content: str = "", role: str = None, finish: str = None, post_id: str = None) -> str:
         """Build SSE response."""
         delta = {}
         if role:
@@ -1002,6 +1002,9 @@ class VideoStreamProcessor(BaseProcessor):
             delta["content"] = ""
         elif content:
             delta["content"] = content
+        
+        if post_id:
+            delta["post_id"] = post_id
 
         chunk = {
             "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -1093,9 +1096,9 @@ class VideoStreamProcessor(BaseProcessor):
                             rendered = await dl_service.render_video(
                                 video_url, self.token, thumbnail_url
                             )
-                            yield self._sse(rendered)
+                            yield self._sse(rendered, post_id=video_post_id)
 
-                            logger.info(f"Video generated: {video_url}")
+                            logger.info(f"Video generated: {video_url} (post_id={video_post_id})")
                     continue
 
             if self.think_opened:
@@ -1311,7 +1314,8 @@ class VideoCollectProcessor(BaseProcessor):
                             content = await dl_service.render_video(
                                 video_url, self.token, thumbnail_url
                             )
-                            logger.info(f"Video generated: {video_url}")
+                            self.video_post_id = fallback_video_id
+                            logger.info(f"Video generated: {video_url} (post_id={fallback_video_id})")
                 elif model_resp := resp.get("modelResponse"):
                     file_attachments = model_resp.get("fileAttachments", [])
                     if isinstance(file_attachments, list):
@@ -1364,6 +1368,9 @@ class VideoCollectProcessor(BaseProcessor):
         finally:
             await self.close()
 
+        # [NEW] 提取并包含 post_id
+        post_id = getattr(self, "video_post_id", fallback_video_id)
+
         if not content and fallback_video_id:
             asset_video_path, asset_thumb_path = await self._resolve_video_asset_path(
                 fallback_video_id
@@ -1393,11 +1400,13 @@ class VideoCollectProcessor(BaseProcessor):
                         "role": "assistant",
                         "content": content,
                         "refusal": None,
+                        "post_id": post_id,
                     },
                     "finish_reason": "stop",
                 }
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "post_id": post_id,
         }
 
 
