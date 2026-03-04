@@ -287,18 +287,18 @@
         // ignore
       }
     }
-    const queryId = cleaned.match(/[?&#](?:parent_post_id|parentPostId|post_id|postId)=([0-9A-Za-z_-]{4,128})(?:[&#]|$)/i);
+    const queryId = cleaned.match(/[?&#](?:parent_post_id|parentPostId|post_id|postId)=([0-9a-fA-F-]{32,36})(?:[&#]|$)/i);
     if (queryId) return queryId[1];
-    // 兼容非 UUID 形态的 postId（例如纯数字或短横线/下划线组合）
-    const direct = cleaned.match(/^[0-9A-Za-z_-]{4,128}$/);
+
+    const direct = cleaned.match(/^[0-9a-fA-F-]{32,36}$/);
     if (direct) return direct[0];
-    const generated = cleaned.match(/\/generated\/([0-9A-Za-z_-]{4,128})(?:[/?#]|$)/);
+    const generated = cleaned.match(/\/generated\/([0-9a-fA-F-]{32,36})(?:[/?#]|$)/);
     if (generated) return generated[1];
-    const imaginePublic = cleaned.match(/\/imagine-public\/images\/([0-9A-Za-z_-]{4,128})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
+    const imaginePublic = cleaned.match(/\/imagine-public\/images\/([0-9a-fA-F-]{32,36})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
     if (imaginePublic) return imaginePublic[1];
-    const imagesTail = cleaned.match(/\/images\/([0-9A-Za-z_-]{4,128})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
+    const imagesTail = cleaned.match(/\/images\/([0-9a-fA-F-]{32,36})(?:\.[A-Za-z0-9]+|[/?#]|$)/);
     if (imagesTail) return imagesTail[1];
-    const all = cleaned.match(/([0-9A-Za-z_-]{4,128})/g);
+    const all = cleaned.match(/([0-9a-fA-F-]{32,36})/g);
     return all && all.length ? all[all.length - 1] : '';
   }
 
@@ -357,8 +357,8 @@
     if (api && typeof api.resolveByText === 'function') {
       try {
         const hit = api.resolveByText(raw);
-        if (hit && hit.parentPostId) {
-          const parentPostId = String(hit.parentPostId || '').trim();
+        if (hit && (hit.parentPostId || hit.id)) {
+          const parentPostId = String(hit.parentPostId || hit.id || '').trim();
           const sourceUrl = pickSourceUrl(hit, parentPostId);
           const previewUrl = pickPreviewUrl(hit, parentPostId, sourceUrl);
           return {
@@ -377,7 +377,9 @@
     }
     const sourceUrl = pickSourceUrl({ sourceImageUrl: raw }, parentPostId, raw);
     const previewUrl = pickPreviewUrl({ imageUrl: raw, sourceImageUrl: sourceUrl }, parentPostId, sourceUrl);
-    return { url: previewUrl || sourceUrl, sourceUrl, parentPostId };
+    // 强制保底：只要有 parentPostId，url 字段就不能是空的字符串或原始 ID 文本
+    const finalUrl = (previewUrl && previewUrl !== parentPostId) ? previewUrl : `https://imagine-public.x.ai/imagine-public/images/${parentPostId}.jpg`;
+    return { url: finalUrl, sourceUrl: sourceUrl || finalUrl, parentPostId };
   }
 
   function applyParentPostReference(text, options = {}) {
@@ -389,19 +391,29 @@
     const finalParentId = resolved.parentPostId || fallbackId;
     const finalSourceUrl = resolved.sourceUrl || fallbackUrl;
     const finalPreviewUrl = resolved.url || finalSourceUrl;
-    if (!finalParentId || !finalPreviewUrl) {
+    // 判定条件优化：只有当 ID 为空 且 预览 URL 均为空时才视作失败
+    if (!finalParentId && !finalPreviewUrl) {
       if (!silent) {
         toast('未识别到有效 parentPostId', 'warning');
       }
       return false;
     }
     if (imageUrlInput) {
-      imageUrlInput.value = finalSourceUrl || finalPreviewUrl;
+      imageUrlInput.value = finalSourceUrl || finalPreviewUrl || '';
     }
     if (parentPostInput) {
       parentPostInput.value = finalParentId;
     }
-    clearFileSelection();
+
+    // 仅清空本地图片变量，不调用全局 clearFileSelection 避免清空自身输入框
+    fileDataUrl = '';
+    if (imageFileInput) {
+      imageFileInput.value = '';
+    }
+    if (imageFileName) {
+      imageFileName.textContent = '未选择文件';
+    }
+
     setReferencePreview(finalPreviewUrl, finalParentId);
     if (!silent) {
       toast('已使用 parentPostId 填充参考图', 'success');
@@ -2270,7 +2282,9 @@
         parentPostInput.value = resolved.parentPostId;
       }
       if (raw && fileDataUrl) {
-        clearFileSelection();
+        fileDataUrl = '';
+        if (imageFileInput) imageFileInput.value = '';
+        if (imageFileName) imageFileName.textContent = '未选择文件';
       }
       setReferencePreview(resolved.url || resolved.sourceUrl || raw, resolved.parentPostId || '');
     });
@@ -2286,7 +2300,9 @@
           parentPostInput.value = resolved.parentPostId;
         }
         if (fileDataUrl) {
-          clearFileSelection();
+          fileDataUrl = '';
+          if (imageFileInput) imageFileInput.value = '';
+          if (imageFileName) imageFileName.textContent = '未选择文件';
         }
         setReferencePreview(resolved.url || resolved.sourceUrl || text, resolved.parentPostId || '');
       }
