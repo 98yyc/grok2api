@@ -799,47 +799,35 @@
     const ids = Array.from(new Set(list.map((b) => String(b.id || '').trim()).filter(Boolean)));
     const nonGeneralIds = ids.filter((id) => !/^general$/i.test(id));
 
-    // 优先按 rollout id 分组，能更稳定地映射多 agent。
-    if (nonGeneralIds.length >= 2) {
-      const groups = [];
-      const map = new Map();
-      for (const block of list) {
-        const key = String(block.id || 'General');
-        let group = map.get(key);
-        if (!group) {
-          group = { key, blocks: [] };
-          map.set(key, group);
-          groups.push(group);
-        }
-        group.blocks.push(block);
-      }
-      return groups.map((group, idx) => ({
-        title: idx === 0 ? 'Grok Leader' : `Agent ${idx}`,
-        blocks: group.blocks
-      }));
+    if (nonGeneralIds.length <= 1) {
+      return [];
     }
-
-    // 兜底：按 AgentThink 作为阶段收束点切分。
-    const sections = [];
-    let current = [];
+    const groups = [];
+    const map = new Map();
     for (const block of list) {
-      current.push(block);
-      if (/^agentthink$/i.test(String(block.type || '').trim())) {
-        sections.push(current);
-        current = [];
+      const key = String(block.id || 'General');
+      let group = map.get(key);
+      if (!group) {
+        group = { key, blocks: [] };
+        map.set(key, group);
+        groups.push(group);
       }
+      group.blocks.push(block);
     }
-    if (current.length) {
-      sections.push(current);
-    }
-
-    if (sections.length <= 1) {
-      return [{ title: 'Grok Leader', blocks: list }];
-    }
-    return sections.map((part, idx) => ({
+    return groups.map((group, idx) => ({
       title: idx === 0 ? 'Grok Leader' : `Agent ${idx}`,
-      blocks: part
+      blocks: group.blocks
     }));
+  }
+
+  function renderFlatBlocks(blocks) {
+    return (Array.isArray(blocks) ? blocks : []).map((item) => {
+      const body = renderBasicMarkdown((item.lines || []).join('\n').trim());
+      const typeText = escapeHtml(item.type);
+      const typeKey = String(item.type || '').trim().toLowerCase().replace(/\s+/g, '');
+      const typeAttr = escapeHtml(typeKey);
+      return `<div class="think-item-row"><div class="think-item-type" data-type="${typeAttr}">${typeText}</div><div class="think-item-body">${body || '<em>（空）</em>'}</div></div>`;
+    }).join('');
   }
 
   function renderThinkContent(text, openAll) {
@@ -878,9 +866,9 @@
       const blocks = parseRolloutBlocks(section.lines.join('\n'), section.title || 'General');
       if (!section.title && blocks.length) {
         const synthetic = splitBlocksIntoSyntheticAgents(blocks);
-        if (synthetic.length > 1) {
+        if (synthetic.length) {
           return synthetic.map((agent, agentIdx) => {
-            const inner = renderGroups(agent.blocks, openAll);
+            const inner = renderFlatBlocks(agent.blocks);
             const title = escapeHtml(agent.title);
             const openAttr = openAll ? ' open' : (idx === 0 && agentIdx === 0 ? ' open' : '');
             return `<details class="think-agent"${openAttr}><summary>${title}</summary><div class="think-agent-items">${inner}</div></details>`;
@@ -1126,6 +1114,27 @@
     if (!entry) return;
     entry.raw = content || '';
     if (!entry.contentNode) return;
+    const captureOpenState = (root, selector) => {
+      if (!root || !root.querySelectorAll) return null;
+      const nodes = Array.from(root.querySelectorAll(selector));
+      if (!nodes.length) return null;
+      return nodes.map((node) => node.hasAttribute('open'));
+    };
+    const restoreOpenState = (root, selector, states) => {
+      if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
+      const nodes = Array.from(root.querySelectorAll(selector));
+      const max = Math.min(nodes.length, states.length);
+      for (let i = 0; i < max; i += 1) {
+        if (states[i]) {
+          nodes[i].setAttribute('open', '');
+        } else {
+          nodes[i].removeAttribute('open');
+        }
+      }
+    };
+    const savedThinkBlockState = captureOpenState(entry.contentNode, '.think-block');
+    const savedThinkAgentState = captureOpenState(entry.contentNode, '.think-agent');
+    const savedRolloutState = captureOpenState(entry.contentNode, '.think-rollout-group');
     if (!entry.hasThink && entry.raw.includes('<think>')) {
       entry.hasThink = true;
     }
@@ -1139,7 +1148,13 @@
         entry.contentNode.textContent = entry.raw;
       }
     }
+    restoreOpenState(entry.contentNode, '.think-block', savedThinkBlockState);
+    restoreOpenState(entry.contentNode, '.think-agent', savedThinkAgentState);
+    restoreOpenState(entry.contentNode, '.think-rollout-group', savedRolloutState);
     if (entry.hasThink) {
+      if (finalize && (entry.thinkElapsed === null || typeof entry.thinkElapsed === 'undefined')) {
+        entry.thinkElapsed = 0;
+      }
       updateThinkSummary(entry, entry.thinkElapsed);
     }
     if (entry.role === 'assistant' || entry.role === 'user') {

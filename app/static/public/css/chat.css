@@ -484,7 +484,10 @@ body {
 }
 
 .think-agent {
+  border: 1px solid var(--chat-border);
+  background: var(--chat-surface);
   border-radius: 12px;
+  padding: 8px 10px 10px;
   width: 100%;
 }
 
@@ -499,6 +502,9 @@ body {
   gap: 8px;
   padding: 4px 8px;
   border-radius: 999px;
+  background: transparent;
+  width: auto;
+  max-width: 100%;
 }
 
 .think-agent summary::before {
@@ -518,7 +524,7 @@ body {
   border-right: 2px solid var(--accents-4);
   border-bottom: 2px solid var(--accents-4);
   transform: rotate(45deg);
-  margin-left: 4px;
+  margin-left: 2px;
 }
 
 .think-agent[open] summary::after {
@@ -531,15 +537,15 @@ body {
 
 @keyframes thinkGlow {
   0% {
-    box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+    box-shadow: 0 0 0 rgba(17, 17, 17, 0);
     background: transparent;
   }
   50% {
-    box-shadow: 0 0 12px rgba(255, 255, 255, 0.9);
-    background: rgba(255, 255, 255, 0.8);
+    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.14);
+    background: rgba(14, 165, 233, 0.08);
   }
   100% {
-    box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+    box-shadow: 0 0 0 rgba(17, 17, 17, 0);
     background: transparent;
   }
 }
@@ -551,7 +557,8 @@ body {
 .think-agent-items {
   margin-top: 10px;
   margin-left: 0;
-  padding-left: 0;
+  padding-left: 2px;
+  padding-right: 2px;
   border-left: none;
   display: flex;
   flex-direction: column;
@@ -623,7 +630,10 @@ body {
 
 .think-item-row {
   border-left: none;
-  padding-left: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--chat-border);
+  border-radius: 10px;
+  background: rgba(17, 17, 17, 0.02);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -666,6 +676,47 @@ body {
   font-size: 12px;
   color: var(--accents-5);
   line-height: 1.6;
+}
+
+html[data-theme='dark'] .think-agent {
+  background: #101924;
+  border-color: #273142;
+}
+
+html[data-theme='dark'] .think-agent summary {
+  background: transparent;
+}
+
+html[data-theme='dark'] .think-item-row {
+  background: #0f1824;
+  border-color: #273142;
+}
+
+html[data-theme='dark'] .think-item-type {
+  color: #9fb2c9;
+}
+
+html[data-theme='dark'] .think-item-body {
+  color: #d5e0ee;
+}
+
+@keyframes thinkGlowDark {
+  0% {
+    box-shadow: 0 0 0 rgba(96, 165, 250, 0);
+    background: transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.2);
+    background: rgba(96, 165, 250, 0.08);
+  }
+  100% {
+    box-shadow: 0 0 0 rgba(96, 165, 250, 0);
+    background: transparent;
+  }
+}
+
+html[data-theme='dark'] .think-block[data-thinking="true"] .think-agent summary {
+  animation: thinkGlowDark 1.6s ease-in-out infinite;
 }
 
 .composer-shell {
