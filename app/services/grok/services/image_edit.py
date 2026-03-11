@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import AsyncGenerator, AsyncIterable, List, Union, Any, Callable
 
 import orjson
+from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.errors import RequestsError
 
 from app.core.config import get_config
@@ -31,6 +32,7 @@ from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.services.chat import GrokChatService
 from app.services.grok.services.video import VideoService
 from app.services.grok.utils.stream import wrap_stream_with_usage
+from app.services.reverse.media_post import MediaPostReverse
 from app.services.token import EffortType
 
 
@@ -38,6 +40,63 @@ from app.services.token import EffortType
 class ImageEditResult:
     stream: bool
     data: Union[AsyncGenerator[str, None], List[str]]
+    token_used: str = ""
+
+
+def _extract_image_post_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for pattern in (
+        r"/generated/([0-9a-fA-F-]{32,36})(?:/|$)",
+        r"/users/[^/]+/([0-9a-fA-F-]{32,36})(?:/content|/|$)",
+        r"/imagine-public/(?:share-images|images)/([0-9a-fA-F-]{32,36})(?:\.[a-z]+|/|$)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    matches = re.findall(r"([0-9a-fA-F-]{32,36})", text)
+    return matches[-1] if matches else ""
+
+
+async def _try_log_image_share_link(
+    token: str,
+    post_id: str,
+    *,
+    local_url: str = "",
+) -> None:
+    token_text = str(token or "").strip()
+    post_text = str(post_id or "").strip()
+    if not token_text or not post_text:
+        return
+    try:
+        logger.info(f"Image create-link attempt: post_id={post_text}")
+        async with AsyncSession() as session:
+            metadata = await MediaPostReverse.capture_metadata(
+                session,
+                token_text,
+                post_text,
+                media_type="image",
+                local_url=local_url,
+            )
+        share_link = str(metadata.get("share_link") or "").strip()
+        metadata_path = str(metadata.get("metadata_path") or "").strip()
+        if share_link:
+            logger.info(
+                "Image create-link success: "
+                f"post_id={post_text}, share_link={share_link}, metadata_path={metadata_path or '-'}"
+            )
+        else:
+            logger.info(
+                "Image create-link completed without shareLink: "
+                f"post_id={post_text}, metadata_path={metadata_path or '-'}"
+            )
+    except Exception as e:
+        details = getattr(e, "details", None)
+        logger.warning(
+            "Image create-link failed: "
+            f"post_id={post_text}, error={e}, details={details}"
+        )
 
 
 def _is_upload_rejected_error(exc: Exception) -> bool:
@@ -99,6 +158,46 @@ def _normalize_fallback_image_url(url: str) -> str:
     if raw.startswith("/"):
         return f"https://assets.grok.com{raw}"
     return f"https://assets.grok.com/{raw}"
+
+
+def _build_parent_source_candidates(parent_post_id: str, source_image_url: str) -> List[str]:
+    """构建 parentPostId 编辑可复用的图片源候选列表。"""
+    candidates: List[str] = []
+
+    raw = str(source_image_url or "").strip()
+    if raw:
+        candidates.append(_normalize_fallback_image_url(raw))
+
+    parent = str(parent_post_id or "").strip()
+    if parent:
+        candidates.extend(
+            [
+                f"https://imagine-public.x.ai/imagine-public/share-images/{parent}.png",
+                f"https://imagine-public.x.ai/imagine-public/share-images/{parent}.jpg",
+                f"https://imagine-public.x.ai/imagine-public/share-images/{parent}.jpeg",
+                f"https://imagine-public.x.ai/imagine-public/images/{parent}.png",
+                f"https://imagine-public.x.ai/imagine-public/images/{parent}.jpg",
+                f"https://imagine-public.x.ai/imagine-public/images/{parent}.jpeg",
+            ]
+        )
+
+    seen: set[str] = set()
+    normalized: List[str] = []
+    for item in candidates:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
+def _should_skip_parent_precreate(image_ref: str) -> bool:
+    """公开分享图直接交给 app-chat 预处理，不在本地显式 create post。"""
+    raw = str(image_ref or "").strip().lower()
+    if "imagine-public.x.ai/imagine-public/share-images/" in raw:
+        return True
+    return False
 
 
 class ImageEditService:
@@ -236,6 +335,7 @@ class ImageEditService:
                             current_token,
                             model_info.model_id,
                         ),
+                        token_used=current_token,
                     )
 
                 await self._emit_progress(
@@ -273,7 +373,11 @@ class ImageEditService:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to record image edit usage: {e}")
-                return ImageEditResult(stream=False, data=images_out)
+                return ImageEditResult(
+                    stream=False,
+                    data=images_out,
+                    token_used=current_token,
+                )
 
             except UpstreamException as e:
                 last_error = e
@@ -343,11 +447,10 @@ class ImageEditService:
                 "已匹配编辑令牌",
             )
             try:
-                image_ref = (source_image_url or "").strip()
-                if not image_ref:
-                    image_ref = (
-                        f"https://imagine-public.x.ai/imagine-public/images/{parent_post_id}.jpg"
-                    )
+                source_candidates = _build_parent_source_candidates(
+                    parent_post_id, source_image_url
+                )
+                image_ref = source_candidates[0] if source_candidates else ""
                 effective_parent_post_id = parent_post_id
                 await self._emit_progress(
                     progress_cb,
@@ -356,37 +459,58 @@ class ImageEditService:
                     "正在创建媒体帖子",
                     parent_post_id=parent_post_id,
                 )
-                try:
-                    # 与 nsfw 的 parentPostId 链路保持一致：先预创建 media post
-                    # 这样上游在 imagine-image-edit 校验 parentPostId 时更稳定。
-                    image_post_id = await VideoService().create_image_post(
-                        current_token, image_ref
-                    )
-                    if image_post_id:
-                        effective_parent_post_id = image_post_id
+                if _should_skip_parent_precreate(image_ref):
                     logger.info(
-                        "Image edit(parentPostId) pre-create media post done: "
-                        f"parent_post_id={parent_post_id}, "
-                        f"image_post_id={effective_parent_post_id}, media_url={image_ref}"
+                        "Image edit(parentPostId) skip pre-create for public share image: "
+                        f"parent_post_id={parent_post_id}, media_url={image_ref}"
                     )
                     await self._emit_progress(
                         progress_cb,
-                        "pre_create_done",
-                        34,
-                        "媒体帖子创建完成",
-                        image_post_id=effective_parent_post_id,
+                        "pre_create_skipped",
+                        26,
+                        "已识别公开分享图，跳过媒体帖子创建",
                     )
-                except Exception as e:
-                    logger.warning(
-                        "Image edit(parentPostId) pre-create media post failed, continue anyway: "
-                        f"parent_post_id={parent_post_id}, media_url={image_ref}, error={e}"
-                    )
-                    await self._emit_progress(
-                        progress_cb,
-                        "pre_create_failed",
-                        28,
-                        "媒体帖子创建失败，继续请求",
-                    )
+                else:
+                    try:
+                        # 同账号原图仍保留预创建逻辑，提升 assets/content 链路稳定性。
+                        image_post_id = ""
+                        precreate_errors: List[str] = []
+                        for candidate in source_candidates:
+                            try:
+                                image_post_id = await VideoService().create_image_post(
+                                    current_token, candidate
+                                )
+                                if image_post_id:
+                                    image_ref = candidate
+                                    effective_parent_post_id = image_post_id
+                                    break
+                            except Exception as candidate_error:
+                                precreate_errors.append(str(candidate_error))
+                        if not image_post_id and precreate_errors:
+                            raise UpstreamException(precreate_errors[-1])
+                        logger.info(
+                            "Image edit(parentPostId) pre-create media post done: "
+                            f"parent_post_id={parent_post_id}, "
+                            f"image_post_id={effective_parent_post_id}, media_url={image_ref}"
+                        )
+                        await self._emit_progress(
+                            progress_cb,
+                            "pre_create_done",
+                            34,
+                            "媒体帖子创建完成",
+                            image_post_id=effective_parent_post_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Image edit(parentPostId) pre-create media post failed, continue anyway: "
+                            f"parent_post_id={parent_post_id}, media_url={image_ref}, error={e}"
+                        )
+                        await self._emit_progress(
+                            progress_cb,
+                            "pre_create_failed",
+                            28,
+                            "媒体帖子创建失败，继续请求",
+                        )
 
                 model_config_override = {
                     "modelMap": {
@@ -424,6 +548,7 @@ class ImageEditService:
                             current_token,
                             model_info.model_id,
                         ),
+                        token_used=current_token,
                     )
 
                 await self._emit_progress(
@@ -462,7 +587,11 @@ class ImageEditService:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to record image edit(parentPostId) usage: {e}")
-                return ImageEditResult(stream=False, data=images_out)
+                return ImageEditResult(
+                    stream=False,
+                    data=images_out,
+                    token_used=current_token,
+                )
 
             except UpstreamException as e:
                 last_error = e
@@ -599,6 +728,14 @@ class ImageEditService:
             raise UpstreamException(
                 "Image edit returned no results", details={"error": "empty_result"}
             )
+        share_items = []
+        if token:
+            for image_url in all_images:
+                post_id = _extract_image_post_id(image_url)
+                if post_id and all(post_id != exist_id for exist_id, _ in share_items):
+                    share_items.append((post_id, image_url))
+            for post_id, image_url in share_items:
+                await _try_log_image_share_link(token, post_id, local_url=image_url)
         if return_all_images:
             return all_images
         return [all_images[0]]
@@ -727,6 +864,9 @@ class ImageStreamProcessor(BaseProcessor):
                         },
                     },
                 )
+                post_id = _extract_image_post_id(b64)
+                if post_id and self.token:
+                    await _try_log_image_share_link(self.token, post_id, local_url=b64)
         except asyncio.CancelledError:
             logger.debug("Image stream cancelled by client")
         except StreamIdleTimeoutError as e:

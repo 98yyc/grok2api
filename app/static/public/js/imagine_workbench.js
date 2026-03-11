@@ -108,6 +108,21 @@
     return `https://imagine-public.x.ai/imagine-public/images/${parentPostId}.jpg`;
   }
 
+  async function fetchParentPostInfo(authHeader, parentPostId) {
+    const pid = String(parentPostId || '').trim();
+    if (!pid) return null;
+    const response = await fetch(`/v1/public/imagine/parent-post?parent_post_id=${encodeURIComponent(pid)}`, {
+      headers: {
+        Authorization: authHeader,
+      },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error((data && (data.detail || data.message)) || `查询 parentPostId 失败 (${response.status})`);
+    }
+    return data;
+  }
+
   function normalizeHttpSourceUrl(value) {
     const raw = String(value || '').trim();
     if (!raw) return '';
@@ -198,10 +213,10 @@
     };
   }
 
-  function applyParentPostFromText(text, options = {}) {
+  async function applyParentPostFromText(text, options = {}) {
     const silent = Boolean(options.silent);
     const addToReferences = Boolean(options.addToReferences);
-    const hit = resolveParentMemoryByText(text);
+    let hit = resolveParentMemoryByText(text);
     if (!hit || !hit.parentPostId) {
       if (!silent) {
         toast('未识别到有效 parentPostId', 'warning');
@@ -209,6 +224,33 @@
       return false;
     }
     const parentPostId = String(hit.parentPostId || '').trim();
+    let authHeader = '';
+    try {
+      authHeader = await ensurePublicAuth();
+    } catch (e) {
+      if (!silent) {
+        toast(String(e.message || e), 'error');
+      }
+      return false;
+    }
+    try {
+      const remoteHit = await fetchParentPostInfo(authHeader, parentPostId);
+      if (remoteHit && remoteHit.parent_post_id) {
+        hit = {
+          ...hit,
+          parentPostId,
+          current_source_image_url: remoteHit.source_image_url,
+          source_image_url: remoteHit.source_image_url,
+          sourceImageUrl: remoteHit.source_image_url,
+          imageUrl: remoteHit.thumbnail_image_url || remoteHit.media_url || hit.imageUrl,
+          image_url: remoteHit.thumbnail_image_url || remoteHit.media_url || hit.imageUrl,
+        };
+      }
+    } catch (e) {
+      if (!silent) {
+        toast(String(e.message || e), 'warning');
+      }
+    }
     const sourceImageUrl = pickSourceImageUrl(hit, parentPostId);
     const previewUrl = pickPreviewUrl(hit, parentPostId);
 
@@ -1100,22 +1142,22 @@
     }
 
     if (applyParentBtn) {
-      applyParentBtn.addEventListener('click', () => {
-        applyParentPostFromText(parentPostInput ? parentPostInput.value : '', { addToReferences: true });
+      applyParentBtn.addEventListener('click', async () => {
+        await applyParentPostFromText(parentPostInput ? parentPostInput.value : '', { addToReferences: true });
       });
     }
 
     if (parentPostInput) {
-      parentPostInput.addEventListener('keydown', (event) => {
+      parentPostInput.addEventListener('keydown', async (event) => {
         if (event.key === 'Enter') {
           event.preventDefault();
-          applyParentPostFromText(parentPostInput.value, { addToReferences: true });
+          await applyParentPostFromText(parentPostInput.value, { addToReferences: true });
         }
       });
-      parentPostInput.addEventListener('input', () => {
+      parentPostInput.addEventListener('input', async () => {
         const raw = parentPostInput.value.trim();
         if (!raw) return;
-        applyParentPostFromText(raw, { silent: true });
+        await applyParentPostFromText(raw, { silent: true });
       });
       parentPostInput.addEventListener('paste', (event) => {
         const text = String(event.clipboardData ? event.clipboardData.getData('text') || '' : '').trim();

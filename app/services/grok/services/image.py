@@ -5,12 +5,14 @@ Grok image services.
 import asyncio
 import base64
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Optional, Union
 
 import orjson
+from curl_cffi.requests import AsyncSession
 
 from app.core.config import get_config
 from app.core.logger import logger
@@ -20,10 +22,67 @@ from app.services.grok.utils.process import BaseProcessor
 from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.utils.stream import wrap_stream_with_usage
 from app.services.token import EffortType
+from app.services.reverse.media_post import MediaPostReverse
 from app.services.reverse.ws_imagine import ImagineWebSocketReverse
 
 
 image_service = ImagineWebSocketReverse()
+
+
+def _extract_image_post_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for pattern in (
+        r"/generated/([0-9a-fA-F-]{32,36})(?:/|$)",
+        r"/users/[^/]+/([0-9a-fA-F-]{32,36})(?:/content|/|$)",
+        r"/imagine-public/(?:share-images|images)/([0-9a-fA-F-]{32,36})(?:\.[a-z]+|/|$)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    matches = re.findall(r"([0-9a-fA-F-]{32,36})", text)
+    return matches[-1] if matches else ""
+
+
+async def _try_log_image_share_link(
+    token: str,
+    post_id: str,
+    *,
+    local_url: str = "",
+) -> None:
+    token_text = str(token or "").strip()
+    post_text = str(post_id or "").strip()
+    if not token_text or not post_text:
+        return
+    try:
+        logger.info(f"Image create-link attempt: post_id={post_text}")
+        async with AsyncSession() as session:
+            metadata = await MediaPostReverse.capture_metadata(
+                session,
+                token_text,
+                post_text,
+                media_type="image",
+                local_url=local_url,
+            )
+        share_link = str(metadata.get("share_link") or "").strip()
+        metadata_path = str(metadata.get("metadata_path") or "").strip()
+        if share_link:
+            logger.info(
+                "Image create-link success: "
+                f"post_id={post_text}, share_link={share_link}, metadata_path={metadata_path or '-'}"
+            )
+        else:
+            logger.info(
+                "Image create-link completed without shareLink: "
+                f"post_id={post_text}, metadata_path={metadata_path or '-'}"
+            )
+    except Exception as e:
+        details = getattr(e, "details", None)
+        logger.warning(
+            "Image create-link failed: "
+            f"post_id={post_text}, error={e}, details={details}"
+        )
 
 
 @dataclass
@@ -628,6 +687,8 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                     },
                 },
             )
+            if image_id and self.token:
+                await _try_log_image_share_link(self.token, image_id, local_url=output)
 
 
 class ImageWSCollectProcessor(ImageWSBaseProcessor):
@@ -662,10 +723,18 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
             selected = selected[: self.n]
 
         results: List[str] = []
+        share_items: List[tuple[str, str]] = []
         for item in selected:
-            output = await self._to_output(item.get("image_id", ""), item)
+            image_id = str(item.get("image_id", "") or "").strip()
+            output = await self._to_output(image_id, item)
             if output:
                 results.append(output)
+                if image_id:
+                    share_items.append((image_id, output))
+
+        if self.token:
+            for post_id, output in share_items:
+                await _try_log_image_share_link(self.token, post_id, local_url=output)
 
         return results
 

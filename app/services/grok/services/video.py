@@ -58,6 +58,47 @@ def _token_tag(token: str) -> str:
     return f"{raw[:6]}...{raw[-6:]}"
 
 
+async def _fetch_media_post_info(token: str, post_id: str) -> dict[str, Any]:
+    """查询官方 post 元信息，统一获得 canonical mediaUrl。"""
+    token_text = str(token or "").strip()
+    post_text = str(post_id or "").strip()
+    if not token_text or not post_text:
+        return {}
+    try:
+        async with AsyncSession() as session:
+            response = await MediaPostReverse.get(session, token_text, post_text)
+        payload = response.json() if response is not None else {}
+        if isinstance(payload, dict):
+            return payload.get("post", {}) or {}
+    except Exception as e:
+        logger.warning(
+            "Video media_post/get failed: "
+            f"post_id={post_text}, token={_token_tag(token_text)}, error={e}"
+        )
+    return {}
+
+
+async def _canonicalize_parent_media_url(
+    token: str,
+    parent_post_id: str,
+    source_image_url: str = "",
+) -> str:
+    """优先使用官方 mediaUrl，避免继续依赖本地猜测路径。"""
+    raw_url = str(source_image_url or "").strip()
+    if "imagine-public.x.ai/imagine-public/share-images/" in raw_url:
+        return raw_url
+    post = await _fetch_media_post_info(token, parent_post_id)
+    media_url = str(post.get("mediaUrl") or "").strip()
+    if media_url:
+        return media_url
+    thumbnail_url = str(post.get("thumbnailImageUrl") or "").strip()
+    if thumbnail_url:
+        return thumbnail_url
+    if raw_url:
+        return raw_url
+    return VideoService._build_imagine_public_url(parent_post_id)
+
+
 def _classify_video_error(exc: Exception) -> tuple[str, str, int]:
     """将底层异常归一化为用户可读错误。"""
     text = str(exc or "").lower()
@@ -90,6 +131,49 @@ def _classify_video_error(exc: Exception) -> tuple[str, str, int]:
         return ("视频生成失败：网络连接异常，请稍后重试", "video_network_error", 502)
 
     return ("视频生成失败，请稍后重试", "video_failed", 502)
+
+
+async def _try_log_video_share_link(
+    token: str,
+    post_id: str,
+    *,
+    local_url: str = "",
+    thumbnail_url: str = "",
+) -> None:
+    """视频生成完成后尝试创建分享链接并写入元数据。"""
+    token_text = str(token or "").strip()
+    post_text = str(post_id or "").strip()
+    if not token_text or not post_text:
+        return
+    try:
+        logger.info(f"Video create-link attempt: post_id={post_text}")
+        async with AsyncSession() as session:
+            metadata = await MediaPostReverse.capture_metadata(
+                session,
+                token_text,
+                post_text,
+                media_type="video",
+                local_url=local_url,
+                thumbnail_url=thumbnail_url,
+            )
+        share_link = str(metadata.get("share_link") or "").strip()
+        metadata_path = str(metadata.get("metadata_path") or "").strip()
+        if share_link:
+            logger.info(
+                "Video create-link success: "
+                f"post_id={post_text}, share_link={share_link}, metadata_path={metadata_path or '-'}"
+            )
+        else:
+            logger.info(
+                "Video create-link completed without shareLink: "
+                f"post_id={post_text}, metadata_path={metadata_path or '-'}"
+            )
+    except Exception as e:
+        details = getattr(e, "details", None)
+        logger.warning(
+            "Video create-link failed: "
+            f"post_id={post_text}, error={e}, details={details}"
+        )
 
 
 class VideoService:
@@ -475,16 +559,20 @@ class VideoService:
             f"ParentPost to video: token={token_tag}, prompt='{prompt[:50]}...', parent_post_id={parent_post_id}"
         )
         raw_source_image_url = (source_image_url or "").strip()
-        source_image_url = self._build_imagine_public_url(parent_post_id)
+        source_image_url = await _canonicalize_parent_media_url(
+            token,
+            parent_post_id,
+            raw_source_image_url,
+        )
         if raw_source_image_url and raw_source_image_url != source_image_url:
             logger.info(
-                "ParentPost source image normalized to imagine-public: "
+                "ParentPost source image canonicalized by media post: "
                 f"token={token_tag}, parent_post_id={parent_post_id}, "
                 f"raw_source_image_url={raw_source_image_url}, normalized_source_image_url={source_image_url}"
             )
 
-        # 对齐官网全链路：先创建 IMAGE 类型 media post，再触发 conversations/new。
-        # 注意：videoGenModelConfig.parentPostId 仍使用 imagine 的 image_id。
+        # 对齐图片再编辑链路：当前 token 使用官方 canonical mediaUrl 预创建 image post。
+        # 注意：videoGenModelConfig.parentPostId 仍使用原始 parent_post_id。
         try:
             created_image_post_id = await self.create_image_post(token, source_image_url)
             logger.info(
@@ -739,7 +827,6 @@ class VideoService:
         file_attachment_id: str | None = None,
         stitch_with_extend: bool = True,
         source_image_url: str | None = None,
-        preferred_token: str | None = None,
     ):
         """Video generation entrypoint."""
         # Get token via intelligent routing.
@@ -762,63 +849,31 @@ class VideoService:
         prompt, file_attachments, image_attachments = MessageExtractor.extract(messages)
         parent_post_id = (parent_post_id or "").strip() or None
         source_image_url = (source_image_url or "").strip()
-        preferred_token = (preferred_token or "").strip()
-
-        # [NEW] 尝试通过 extend_post_id 或者 parent_post_id 获取强绑定的 token
-        from app.services.grok.utils.asset_token_map import AssetTokenMap
-        token_map = await AssetTokenMap.get_instance()
-        bound_token = None
-        if extend_post_id:
-            bound_token = await token_map.get_token(extend_post_id)
-        elif parent_post_id:
-            bound_token = await token_map.get_token(parent_post_id)
-            
-        if bound_token:
-            preferred_token = bound_token
-
-        if preferred_token.startswith("sso="):
-            preferred_token = preferred_token[4:]
         used_tokens: set[str] = set()
 
         for attempt in range(max_token_retries):
-            token = ""
-            if preferred_token and preferred_token not in used_tokens:
-                if token_mgr.get_pool_name_for_token(preferred_token):
-                    token = preferred_token
-                    logger.info(
-                        f"Video token routing: preferred bound token -> "
-                        f"token={_token_tag(token)}"
-                    )
-                else:
-                    used_tokens.add(preferred_token)
-                    logger.warning(
-                        f"Video token routing: preferred bound token not in pool, fallback to normal routing "
-                        f"(token={_token_tag(preferred_token)})"
-                    )
+            # 统一从当前池内 token 选择，不再复用历史绑定 token。
+            pool_candidates = ModelService.pool_candidates_for_model(model)
+            token_info = token_mgr.get_token_for_video(
+                resolution=resolution,
+                video_length=video_length,
+                pool_candidates=pool_candidates,
+                exclude=used_tokens,
+            )
 
-            if not token:
-                # Select token based on video requirements and pool candidates.
-                pool_candidates = ModelService.pool_candidates_for_model(model)
-                token_info = token_mgr.get_token_for_video(
-                    resolution=resolution,
-                    video_length=video_length,
-                    pool_candidates=pool_candidates,
-                    exclude=used_tokens,
+            if not token_info:
+                if last_error:
+                    raise last_error
+                raise AppException(
+                    message="No available tokens. Please try again later.",
+                    error_type=ErrorType.RATE_LIMIT.value,
+                    code="rate_limit_exceeded",
+                    status_code=429,
                 )
 
-                if not token_info:
-                    if last_error:
-                        raise last_error
-                    raise AppException(
-                        message="No available tokens. Please try again later.",
-                        error_type=ErrorType.RATE_LIMIT.value,
-                        code="rate_limit_exceeded",
-                        status_code=429,
-                    )
-
-                token = token_info.token
-                if token.startswith("sso="):
-                    token = token[4:]
+            token = token_info.token
+            if token.startswith("sso="):
+                token = token[4:]
 
             used_tokens.add(token)
             should_upscale = bool(get_config("video.auto_upscale", True))
@@ -1075,12 +1130,7 @@ class VideoStreamProcessor(BaseProcessor):
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
                         
-                        # [NEW] 记录生成的视频对应的 postId 与 token 以备延长
                         video_post_id = video_resp.get("videoPostId") or self._extract_video_id(video_url)
-                        if video_post_id and self.token:
-                            from app.services.grok.utils.asset_token_map import AssetTokenMap
-                            token_map = await AssetTokenMap.get_instance()
-                            await token_map.save_mapping(video_post_id, self.token)
 
                         if self.think_opened:
                             yield self._sse("\n</think>\n")
@@ -1107,6 +1157,13 @@ class VideoStreamProcessor(BaseProcessor):
                             yield self._sse(rendered)
 
                             logger.info(f"Video generated: {video_url} (post_id={video_post_id})")
+                            if video_post_id and self.token:
+                                await _try_log_video_share_link(
+                                    self.token,
+                                    video_post_id,
+                                    local_url=rendered,
+                                    thumbnail_url=thumbnail_url,
+                                )
                     continue
 
             if self.think_opened:
@@ -1310,11 +1367,6 @@ class VideoCollectProcessor(BaseProcessor):
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
                         
                         # [NEW] 记录生成的视频对应的 postId 与 token 以备延长
-                        if fallback_video_id and self.token:
-                            from app.services.grok.utils.asset_token_map import AssetTokenMap
-                            token_map = await AssetTokenMap.get_instance()
-                            await token_map.save_mapping(fallback_video_id, self.token)
-
                         if video_url:
                             if self.upscale_on_finish:
                                 video_url = await self._upscale_video_url(video_url)
@@ -1334,6 +1386,13 @@ class VideoCollectProcessor(BaseProcessor):
                             )
                             self.video_post_id = fallback_video_id
                             logger.info(f"Video generated: {video_url} (post_id={fallback_video_id})")
+                            if fallback_video_id and self.token:
+                                await _try_log_video_share_link(
+                                    self.token,
+                                    fallback_video_id,
+                                    local_url=video_url,
+                                    thumbnail_url=thumbnail_url,
+                                )
                 elif model_resp := resp.get("modelResponse"):
                     file_attachments = model_resp.get("fileAttachments", [])
                     if isinstance(file_attachments, list):

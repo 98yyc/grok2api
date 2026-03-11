@@ -14,7 +14,6 @@ from app.core.logger import logger
 from app.core.exceptions import AppException
 from app.services.grok.services.video import VideoService
 from app.services.grok.services.model import ModelService
-from app.api.v1.public_api import imagine as imagine_public_api
 from app.services.grok.utils.cache import CacheService
 
 router = APIRouter()
@@ -81,18 +80,6 @@ def _extract_parent_post_id_from_url(url: str) -> str:
             return match.group(1)
     matches = re.findall(r"([0-9a-fA-F-]{32,36})", text)
     return matches[-1] if matches else ""
-
-
-def _build_imagine_public_url(parent_post_id: str) -> str:
-    return f"https://imagine-public.x.ai/imagine-public/images/{parent_post_id}.jpg"
-
-
-def _mask_token(token: str) -> str:
-    raw = str(token or "").replace("sso=", "")
-    if len(raw) <= 12:
-        return raw or "-"
-    return f"{raw[:6]}...{raw[-6:]}"
-
 
 async def _clean_sessions(now: float) -> None:
     expired = [
@@ -271,8 +258,8 @@ async def public_video_start(data: VideoStartRequest):
     parent_post_id = _validate_parent_post_id(data.parent_post_id or "")
     source_image_url = (data.source_image_url or "").strip() or None
     if parent_post_id:
-        # parentPostId 链路强制使用 imagine-public，避免误用 assets.grok.com。
-        source_image_url = _build_imagine_public_url(parent_post_id)
+        if source_image_url:
+            _validate_image_url(source_image_url)
     elif source_image_url:
         _validate_image_url(source_image_url)
 
@@ -387,31 +374,10 @@ async def public_video_sse(request: Request, task_id: str = Query("")):
     image_url = session.get("image_url")
     parent_post_id = str(session.get("parent_post_id") or "").strip()
     source_image_url = str(session.get("source_image_url") or "").strip() or None
-    if parent_post_id:
-        source_image_url = _build_imagine_public_url(parent_post_id)
     reasoning_effort = session.get("reasoning_effort")
 
     async def event_stream():
         try:
-            preferred_token = None
-            if parent_post_id:
-                try:
-                    preferred_token = await imagine_public_api._get_bound_image_token(
-                        parent_post_id
-                    )
-                except Exception:
-                    preferred_token = None
-                if preferred_token:
-                    logger.info(
-                        "Public video token bound hit: "
-                        f"parent_post_id={parent_post_id}, token={_mask_token(preferred_token)}"
-                    )
-                else:
-                    logger.info(
-                        "Public video token bound miss: "
-                        f"parent_post_id={parent_post_id}"
-                    )
-
             model_id = "grok-imagine-1.0-video"
             model_info = ModelService.get(model_id)
             if not model_info or not model_info.is_video:
@@ -460,7 +426,6 @@ async def public_video_sse(request: Request, task_id: str = Query("")):
                 file_attachment_id=file_attachment_id if is_video_extension else None,
                 stitch_with_extend=stitch_with_extend,
                 source_image_url=source_image_url,
-                preferred_token=preferred_token,
             )
 
             async for chunk in stream:

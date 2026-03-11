@@ -217,6 +217,25 @@
     return `https://imagine-public.x.ai/imagine-public/images/${parentPostId}.jpg`;
   }
 
+  function buildPostShareLink(parentPostId) {
+    const pid = String(parentPostId || '').trim();
+    if (!pid) return '';
+    return `https://grok.com/imagine/post/${pid}?source=post-page&platform=web`;
+  }
+
+  async function fetchParentPostInfo(authHeader, parentPostId) {
+    const pid = String(parentPostId || '').trim();
+    if (!pid) return null;
+    const res = await fetch(`/v1/public/imagine/parent-post?parent_post_id=${encodeURIComponent(pid)}`, {
+      headers: buildAuthHeaders(authHeader),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error((data && (data.detail || data.message)) || `查询 parentPostId 失败 (${res.status})`);
+    }
+    return data;
+  }
+
   function normalizeHttpSourceUrl(value) {
     const raw = String(value || '').trim();
     if (!raw) return '';
@@ -256,8 +275,45 @@
     }
   }
 
-  function resolveSourceImageByParentPostId(parentPostId, fallbackUrl) {
+  function getPreferredCopyValue(entryLike) {
+    const explicitShareLink = String(
+      (entryLike && (
+        entryLike.shareLink
+        || entryLike.share_link
+        || (entryLike.dataset && entryLike.dataset.shareLink)
+      )) || ''
+    ).trim();
+    if (explicitShareLink) {
+      return explicitShareLink;
+    }
+    const parentPostId = String(
+      (entryLike && (
+        entryLike.parentPostId
+        || entryLike.parent_post_id
+        || (entryLike.dataset && entryLike.dataset.parentPostId)
+      )) || ''
+    ).trim();
+    return buildPostShareLink(parentPostId);
+  }
+
+  async function resolveSourceImageByParentPostId(authHeader, parentPostId, fallbackUrl) {
     const fallback = pickSourceImageUrl([fallbackUrl], parentPostId);
+    try {
+      const remote = await fetchParentPostInfo(authHeader, parentPostId);
+      if (remote) {
+        return pickSourceImageUrl(
+          [
+            remote.source_image_url,
+            remote.media_url,
+            remote.thumbnail_image_url,
+            fallback,
+          ],
+          parentPostId
+        );
+      }
+    } catch (e) {
+      // ignore
+    }
     const api = getParentMemoryApi();
     if (!api) return fallback;
     try {
@@ -843,15 +899,15 @@
       copyBtn.textContent = '复制ID';
       copyBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        const parentPostId = String(entry.parentPostId || '').trim();
-        if (!parentPostId) {
-          toast('当前记录没有 parentPostId', 'warning');
+        const copyValue = getPreferredCopyValue(entry);
+        if (!copyValue) {
+          toast('当前记录没有可复制的分享链接', 'warning');
           return;
         }
         try {
-          const copied = await copyText(parentPostId);
+          const copied = await copyText(copyValue);
           if (!copied) throw new Error('copy_failed');
-          toast('已复制 parentPostId', 'success');
+          toast('已复制分享链接', 'success');
         } catch (err) {
           toast('复制失败', 'error');
         }
@@ -882,32 +938,30 @@
       btn.textContent = '复制ID';
       metaBar.appendChild(btn);
     }
-    const parentPostId = String(item.dataset.parentPostId || '').trim();
-    if (parentPostId) {
+    const copyValue = getPreferredCopyValue(item);
+    if (copyValue) {
       btn.classList.remove('is-hidden');
-      btn.title = `复制 parentPostId: ${parentPostId}`;
-      btn.dataset.parentPostId = parentPostId;
+      btn.title = `复制分享链接: ${copyValue}`;
     } else {
       btn.classList.add('is-hidden');
       btn.removeAttribute('title');
-      btn.dataset.parentPostId = '';
     }
   }
 
   async function copyParentPostIdFromItem(item) {
-    const parentPostId = item ? String(item.dataset.parentPostId || '').trim() : '';
-    if (!parentPostId) {
-      toast('当前图片暂无 parentPostId', 'warning');
+    const copyValue = getPreferredCopyValue(item);
+    if (!copyValue) {
+      toast('当前图片暂无可复制的分享链接', 'warning');
       return;
     }
     try {
-      const copied = await copyText(parentPostId);
+      const copied = await copyText(copyValue);
       if (!copied) {
         throw new Error('复制失败');
       }
-      toast(`已复制 parentPostId：${parentPostId}`, 'success');
+      toast('已复制分享链接', 'success');
     } catch (e) {
-      toast('复制 parentPostId 失败', 'error');
+      toast('复制分享链接失败', 'error');
     }
   }
 
@@ -1932,7 +1986,8 @@
       return;
     }
 
-    const sourceImageUrl = resolveSourceImageByParentPostId(
+    const sourceImageUrl = await resolveSourceImageByParentPostId(
+      authHeader,
       parentPostId,
       String(item.dataset.sourceImageUrl || '').trim()
     );
@@ -1999,9 +2054,11 @@
       item.dataset.imageUrl = displayUrl;
       item.dataset.prompt = finalPrompt;
       item.dataset.parentPostId = generatedParent;
+      item.dataset.shareLink = buildPostShareLink(generatedParent);
       item.dataset.sourceImageUrl = nextSourceImageUrl;
       rememberParentPost({
         parentPostId: generatedParent,
+        shareLink: buildPostShareLink(generatedParent),
         sourceImageUrl: nextSourceImageUrl,
         imageUrl: displayUrl,
         origin: 'imagine_edit',
@@ -2022,6 +2079,7 @@
         prompt: finalPrompt,
         imageUrl: displayUrl,
         parentPostId: generatedParent,
+        shareLink: buildPostShareLink(generatedParent),
         sourceImageUrl: nextSourceImageUrl,
         elapsedMs: Number.isFinite(elapsed) ? Math.max(0, Math.round(elapsed)) : 0,
         createdAt: Date.now(),
