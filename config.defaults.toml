@@ -124,6 +124,8 @@ concurrent = 100
 timeout = 60
 # 流式空闲超时时间（秒）
 stream_timeout = 60
+# 视频延长流式空闲超时时间（秒）
+extension_stream_timeout = 300
 
 # ==================== 语音配置 ====================
 [voice]

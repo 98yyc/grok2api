@@ -1257,19 +1257,29 @@ class VideoService:
                     )
 
                 # Process response.
+                idle_timeout_override = None
+                if extend_post_id and video_extension_start_time is not None:
+                    idle_timeout_override = (
+                        get_config("video.extension_stream_timeout")
+                        or get_config("video.stream_timeout")
+                    )
                 if is_stream:
                     processor = VideoStreamProcessor(
                         model,
                         token,
                         show_think,
                         upscale_on_finish=should_upscale,
+                        idle_timeout_override=idle_timeout_override,
                     )
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 result = await VideoCollectProcessor(
-                    model, token, upscale_on_finish=should_upscale
+                    model,
+                    token,
+                    upscale_on_finish=should_upscale,
+                    idle_timeout_override=idle_timeout_override,
                 ).process(response)
                 try:
                     model_info = ModelService.get(model)
@@ -1322,6 +1332,7 @@ class VideoStreamProcessor(BaseProcessor):
         token: str = "",
         show_think: bool = None,
         upscale_on_finish: bool = False,
+        idle_timeout_override: float | None = None,
     ):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
@@ -1330,6 +1341,7 @@ class VideoStreamProcessor(BaseProcessor):
 
         self.show_think = bool(show_think)
         self.upscale_on_finish = bool(upscale_on_finish)
+        self.idle_timeout_override = idle_timeout_override
 
     @staticmethod
     def _extract_video_id(video_url: str) -> str:
@@ -1388,7 +1400,7 @@ class VideoStreamProcessor(BaseProcessor):
         self, response: AsyncIterable[bytes]
     ) -> AsyncGenerator[str, None]:
         """Process video stream response."""
-        idle_timeout = get_config("video.stream_timeout")
+        idle_timeout = self.idle_timeout_override or get_config("video.stream_timeout")
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
@@ -1534,9 +1546,16 @@ class VideoStreamProcessor(BaseProcessor):
 class VideoCollectProcessor(BaseProcessor):
     """Video non-stream response processor."""
 
-    def __init__(self, model: str, token: str = "", upscale_on_finish: bool = False):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        upscale_on_finish: bool = False,
+        idle_timeout_override: float | None = None,
+    ):
         super().__init__(model, token)
         self.upscale_on_finish = bool(upscale_on_finish)
+        self.idle_timeout_override = idle_timeout_override
 
     @staticmethod
     def _extract_video_id(video_url: str) -> str:
@@ -1648,7 +1667,7 @@ class VideoCollectProcessor(BaseProcessor):
         content = ""
         fallback_video_id = ""
         fallback_thumb = ""
-        idle_timeout = get_config("video.stream_timeout")
+        idle_timeout = self.idle_timeout_override or get_config("video.stream_timeout")
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
