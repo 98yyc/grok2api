@@ -4,6 +4,7 @@ Reverse interface: media post create/get.
 
 import asyncio
 import json
+import re
 import urllib.request
 from pathlib import Path
 from dataclasses import dataclass
@@ -87,9 +88,15 @@ class MediaPostReverse:
         except Exception as e:
             logger.warning(f"MediaPost metadata create-link failed: post_id={post_text}, error={e}")
 
+        canonical_post_id = post_text
+        if share_link:
+            match = re.search(r"/imagine/post/([0-9a-fA-F-]{32,36})", share_link)
+            if match:
+                canonical_post_id = match.group(1)
+
         post = post_payload.get("post", {}) if isinstance(post_payload, dict) else {}
         metadata: dict[str, Any] = {
-            "post_id": post_text,
+            "post_id": canonical_post_id,
             "share_link": share_link,
             "media_type": str(media_type or post.get("mediaType") or "").strip(),
             "media_url": str(post.get("mediaUrl") or "").strip(),
@@ -103,7 +110,7 @@ class MediaPostReverse:
         }
         if extra:
             metadata.update(extra)
-        path = await MediaPostReverse.write_metadata(post_text, metadata)
+        path = await MediaPostReverse.write_metadata(canonical_post_id, metadata)
         if path:
             metadata["metadata_path"] = str(path)
         return metadata

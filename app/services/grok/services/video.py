@@ -135,6 +135,41 @@ def _log_final_video_payload(
     logger.info(f"Video upstream payload before send:\n{payload_text}")
 
 
+def _log_raw_video_stream_event(raw_text: str) -> None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return
+    try:
+        payload = orjson.loads(text)
+        pretty = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode("utf-8")
+    except Exception:
+        pretty = text
+    logger.info(f"Video upstream raw event:\n{pretty}")
+
+
+def _truncate_video_stream_line(raw_text: str, limit: int = 4000) -> str:
+    text = str(raw_text or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(len={len(text)})"
+
+
+def _log_video_stream_line(*, stage: str, raw_text: str) -> None:
+    text = str(raw_text or "")
+    if not text:
+        logger.info(f"Video upstream {stage}: <empty>")
+        return
+    logger.info(
+        "Video upstream line "
+        f"({stage}): {_truncate_video_stream_line(text)}"
+    )
+
+
+def _log_video_stream_end(*, stage: str, reason: str, extra: str = "") -> None:
+    suffix = f", {extra}" if extra else ""
+    logger.info(f"Video upstream stream ended ({stage}): reason={reason}{suffix}")
+
+
 def _classify_video_error(exc: Exception) -> tuple[str, str, int]:
     """将底层异常归一化为用户可读错误。"""
     text = str(exc or "").lower()
@@ -175,12 +210,12 @@ async def _try_log_video_share_link(
     *,
     local_url: str = "",
     thumbnail_url: str = "",
-) -> None:
+) -> str:
     """视频生成完成后尝试创建分享链接并写入元数据。"""
     token_text = str(token or "").strip()
     post_text = str(post_id or "").strip()
     if not token_text or not post_text:
-        return
+        return ""
     try:
         logger.info(f"Video create-link attempt: post_id={post_text}")
         async with AsyncSession() as session:
@@ -204,12 +239,47 @@ async def _try_log_video_share_link(
                 "Video create-link completed without shareLink: "
                 f"post_id={post_text}, metadata_path={metadata_path or '-'}"
             )
+        return share_link
     except Exception as e:
         details = getattr(e, "details", None)
         logger.warning(
             "Video create-link failed: "
             f"post_id={post_text}, error={e}, details={details}"
         )
+        return ""
+
+
+async def _fetch_share_page_media_urls(share_link: str) -> tuple[str, str]:
+    share_text = str(share_link or "").strip()
+    if not share_text:
+        return "", ""
+    try:
+        async with AsyncSession() as session:
+            response = await session.get(share_text, timeout=get_config("video.timeout"))
+        html = str(getattr(response, "text", "") or "")
+        if not html:
+            return "", ""
+        video_match = re.search(
+            r'<meta\s+property="og:video"\s+content="([^"]+)"',
+            html,
+            flags=re.IGNORECASE,
+        )
+        image_match = re.search(
+            r'<meta\s+property="og:image"\s+content="([^"]+)"',
+            html,
+            flags=re.IGNORECASE,
+        )
+        video_url = str(video_match.group(1) if video_match else "").strip()
+        image_url = str(image_match.group(1) if image_match else "").strip()
+        if video_url or image_url:
+            logger.info(
+                "Video share page meta resolved: "
+                f"share_link={share_text}, video_url={video_url or '-'}, image_url={image_url or '-'}"
+            )
+        return video_url, image_url
+    except Exception as e:
+        logger.warning(f"Video share page fetch failed: share_link={share_text}, error={e}")
+        return "", ""
 
 
 class VideoService:
@@ -1257,19 +1327,13 @@ class VideoService:
                     )
 
                 # Process response.
-                idle_timeout_override = None
-                if extend_post_id and video_extension_start_time is not None:
-                    idle_timeout_override = (
-                        get_config("video.extension_stream_timeout")
-                        or get_config("video.stream_timeout")
-                    )
                 if is_stream:
                     processor = VideoStreamProcessor(
                         model,
                         token,
                         show_think,
                         upscale_on_finish=should_upscale,
-                        idle_timeout_override=idle_timeout_override,
+                        idle_timeout_override=None,
                     )
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
@@ -1279,7 +1343,7 @@ class VideoService:
                     model,
                     token,
                     upscale_on_finish=should_upscale,
-                    idle_timeout_override=idle_timeout_override,
+                    idle_timeout_override=None,
                 ).process(response)
                 try:
                     model_info = ModelService.get(model)
@@ -1376,6 +1440,108 @@ class VideoStreamProcessor(BaseProcessor):
             logger.warning(f"Video upscale failed: {e}")
         return video_url
 
+    async def _try_render_from_post(
+        self,
+        *,
+        post_id: str,
+        progress: int = 0,
+        thumbnail_url: str = "",
+    ) -> str:
+        post_text = str(post_id or "").strip()
+        if not post_text or not self.token:
+            return ""
+        logger.info(
+            "Video stream high-progress fallback: "
+            f"try create-link/media-post lookup, post_id={post_text}, progress={progress}"
+        )
+        share_link = await _try_log_video_share_link(
+            self.token,
+            post_text,
+            thumbnail_url=thumbnail_url,
+        )
+        if share_link:
+            share_video_url, share_thumb_url = await _fetch_share_page_media_urls(share_link)
+            if share_video_url:
+                render_started_at = time.perf_counter()
+                logger.info(
+                    "Video stream high-progress share-link render started: "
+                    f"post_id={post_text}, media_url={share_video_url}, thumbnail_url={share_thumb_url or thumbnail_url or '-'}"
+                )
+                rendered = await self._get_dl().render_video(
+                    share_video_url,
+                    self.token,
+                    share_thumb_url or thumbnail_url,
+                )
+                render_duration_ms = (time.perf_counter() - render_started_at) * 1000
+                logger.info(
+                    "Video stream high-progress share-link render completed: "
+                    f"post_id={post_text}, duration_ms={render_duration_ms:.2f}, rendered={rendered}"
+                )
+                return rendered
+        post = await _fetch_media_post_info(self.token, post_text)
+        media_url = _normalize_assets_url(str(post.get("mediaUrl") or "").strip())
+        thumb_url = _normalize_assets_url(
+            str(post.get("thumbnailImageUrl") or thumbnail_url or "").strip()
+        )
+        if not media_url:
+            logger.info(
+                "Video stream high-progress fallback miss: "
+                f"post_id={post_text}, progress={progress}"
+            )
+            return ""
+        render_started_at = time.perf_counter()
+        logger.info(
+            "Video stream high-progress fallback render started: "
+            f"post_id={post_text}, media_url={media_url}, thumbnail_url={thumb_url or '-'}"
+        )
+        rendered = await self._get_dl().render_video(media_url, self.token, thumb_url)
+        render_duration_ms = (time.perf_counter() - render_started_at) * 1000
+        logger.info(
+            "Video stream high-progress fallback render completed: "
+            f"post_id={post_text}, duration_ms={render_duration_ms:.2f}, rendered={rendered}"
+        )
+        return rendered
+
+    async def _try_render_from_post_with_retry(
+        self,
+        *,
+        post_id: str,
+        progress: int = 0,
+        thumbnail_url: str = "",
+        retry_delay_seconds: int = 30,
+    ) -> str:
+        rendered = await self._try_render_from_post(
+            post_id=post_id,
+            progress=progress,
+            thumbnail_url=thumbnail_url,
+        )
+        if rendered:
+            return rendered
+        logger.info(
+            "Video stream high-progress fallback retry scheduled: "
+            f"post_id={post_id}, progress={progress}, delay={retry_delay_seconds}s"
+        )
+        await asyncio.sleep(max(1, int(retry_delay_seconds)))
+        return await self._try_render_from_post(
+            post_id=post_id,
+            progress=progress,
+            thumbnail_url=thumbnail_url,
+        )
+
+    async def _wait_before_eof_fallback(
+        self,
+        *,
+        post_id: str,
+        progress: int,
+        wait_seconds: int = 60,
+    ) -> None:
+        delay = max(1, int(wait_seconds))
+        logger.info(
+            "Video stream EOF fallback wait scheduled: "
+            f"post_id={post_id}, progress={progress}, delay={delay}s"
+        )
+        await asyncio.sleep(delay)
+
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """Build SSE response."""
         delta = {}
@@ -1401,16 +1567,32 @@ class VideoStreamProcessor(BaseProcessor):
     ) -> AsyncGenerator[str, None]:
         """Process video stream response."""
         idle_timeout = self.idle_timeout_override or get_config("video.stream_timeout")
+        latest_progress = 0
+        latest_video_post_id = ""
+        latest_thumbnail_url = ""
+        final_rendered = False
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
+                raw_line = (
+                    line.decode("utf-8", errors="ignore")
+                    if isinstance(line, (bytes, bytearray))
+                    else str(line)
+                )
+                _log_video_stream_line(stage="stream/raw", raw_text=raw_line)
                 line = _normalize_line(line)
                 if not line:
+                    _log_video_stream_line(
+                        stage="stream/normalized", raw_text="<empty-after-normalize>"
+                    )
                     continue
+                _log_video_stream_line(stage="stream/normalized", raw_text=line)
                 try:
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
+                    _log_video_stream_line(stage="stream/non-json", raw_text=line)
                     continue
+                _log_raw_video_stream_event(line)
 
                 resp = data.get("result", {}).get("response", {})
                 is_thinking = bool(resp.get("isThinking"))
@@ -1438,6 +1620,17 @@ class VideoStreamProcessor(BaseProcessor):
 
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     progress = video_resp.get("progress", 0)
+                    latest_progress = max(latest_progress, int(progress or 0))
+                    latest_video_post_id = str(
+                        video_resp.get("videoPostId")
+                        or video_resp.get("assetId")
+                        or video_resp.get("videoId")
+                        or latest_video_post_id
+                    ).strip()
+                    latest_thumbnail_url = str(
+                        video_resp.get("thumbnailImageUrl")
+                        or latest_thumbnail_url
+                    ).strip()
 
                     if is_thinking:
                         if not self.show_think:
@@ -1481,6 +1674,7 @@ class VideoStreamProcessor(BaseProcessor):
                                 f"post_id={video_post_id or '-'}, duration_ms={render_duration_ms:.2f}"
                             )
                             yield self._sse(rendered)
+                            final_rendered = True
 
                             logger.info(f"Video generated: {video_url} (post_id={video_post_id})")
                             if video_post_id and self.token:
@@ -1492,15 +1686,73 @@ class VideoStreamProcessor(BaseProcessor):
                                 )
                     continue
 
+            if (not final_rendered) and latest_progress >= 90 and latest_video_post_id:
+                await self._wait_before_eof_fallback(
+                    post_id=latest_video_post_id,
+                    progress=latest_progress,
+                    wait_seconds=60,
+                )
+                rendered = await self._try_render_from_post_with_retry(
+                    post_id=latest_video_post_id,
+                    progress=latest_progress,
+                    thumbnail_url=latest_thumbnail_url,
+                )
+                if rendered:
+                    logger.info(
+                        "Video generated via high-progress fallback: "
+                        f"post_id={latest_video_post_id}, progress={latest_progress}"
+                    )
+                    if latest_video_post_id and self.token:
+                        await _try_log_video_share_link(
+                            self.token,
+                            latest_video_post_id,
+                            local_url=rendered,
+                            thumbnail_url=latest_thumbnail_url,
+                        )
+                    yield self._sse(rendered)
+                    final_rendered = True
+
+            _log_video_stream_end(stage="stream", reason="upstream_eof")
             if self.think_opened:
                 yield self._sse("</think>\n")
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
+            _log_video_stream_end(stage="stream", reason="cancelled")
             logger.debug(
                 "Video stream cancelled by client", extra={"model": self.model}
             )
         except StreamIdleTimeoutError as e:
+            if (not final_rendered) and latest_progress >= 90 and latest_video_post_id:
+                rendered = await self._try_render_from_post_with_retry(
+                    post_id=latest_video_post_id,
+                    progress=latest_progress,
+                    thumbnail_url=latest_thumbnail_url,
+                )
+                if rendered:
+                    if self.think_opened:
+                        yield self._sse("</think>\n")
+                        self.think_opened = False
+                    logger.info(
+                        "Video generated via high-progress timeout fallback: "
+                        f"post_id={latest_video_post_id}, progress={latest_progress}"
+                    )
+                    if latest_video_post_id and self.token:
+                        await _try_log_video_share_link(
+                            self.token,
+                            latest_video_post_id,
+                            local_url=rendered,
+                            thumbnail_url=latest_thumbnail_url,
+                        )
+                    yield self._sse(rendered)
+                    yield self._sse(finish="stop")
+                    yield "data: [DONE]\n\n"
+                    return
+            _log_video_stream_end(
+                stage="stream",
+                reason="idle_timeout",
+                extra=f"timeout={idle_timeout}",
+            )
             raise AppException(
                 message="视频生成失败：网络连接异常，请稍后重试",
                 error_type=ErrorType.SERVER.value,
@@ -1508,6 +1760,11 @@ class VideoStreamProcessor(BaseProcessor):
                 status_code=504,
             )
         except RequestsError as e:
+            _log_video_stream_end(
+                stage="stream",
+                reason="request_error",
+                extra=f"error={e}",
+            )
             if _is_http2_error(e):
                 logger.warning(
                     f"HTTP/2 stream error in video: {e}", extra={"model": self.model}
@@ -1528,6 +1785,11 @@ class VideoStreamProcessor(BaseProcessor):
                 status_code=502,
             )
         except Exception as e:
+            _log_video_stream_end(
+                stage="stream",
+                reason="exception",
+                extra=f"type={type(e).__name__}, error={e}",
+            )
             logger.error(
                 f"Video stream processing error: {e}",
                 extra={"model": self.model, "error_type": type(e).__name__},
@@ -1671,13 +1933,25 @@ class VideoCollectProcessor(BaseProcessor):
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
+                raw_line = (
+                    line.decode("utf-8", errors="ignore")
+                    if isinstance(line, (bytes, bytearray))
+                    else str(line)
+                )
+                _log_video_stream_line(stage="collect/raw", raw_text=raw_line)
                 line = _normalize_line(line)
                 if not line:
+                    _log_video_stream_line(
+                        stage="collect/normalized", raw_text="<empty-after-normalize>"
+                    )
                     continue
+                _log_video_stream_line(stage="collect/normalized", raw_text=line)
                 try:
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
+                    _log_video_stream_line(stage="collect/non-json", raw_text=line)
                     continue
+                _log_raw_video_stream_event(line)
 
                 resp = data.get("result", {}).get("response", {})
 
@@ -1735,15 +2009,31 @@ class VideoCollectProcessor(BaseProcessor):
                                 fallback_video_id = fid
                                 break
 
+            _log_video_stream_end(
+                stage="collect",
+                reason="upstream_eof",
+                extra=f"has_content={bool(content)}, fallback_video_id={fallback_video_id or '-'}",
+            )
         except asyncio.CancelledError:
+            _log_video_stream_end(stage="collect", reason="cancelled")
             logger.debug(
                 "Video collect cancelled by client", extra={"model": self.model}
             )
         except StreamIdleTimeoutError as e:
+            _log_video_stream_end(
+                stage="collect",
+                reason="idle_timeout",
+                extra=f"timeout={idle_timeout}, fallback_video_id={fallback_video_id or '-'}",
+            )
             logger.warning(
                 f"Video collect idle timeout: {e}", extra={"model": self.model}
             )
         except RequestsError as e:
+            _log_video_stream_end(
+                stage="collect",
+                reason="request_error",
+                extra=f"error={e}, fallback_video_id={fallback_video_id or '-'}",
+            )
             if _is_http2_error(e):
                 logger.warning(
                     f"HTTP/2 stream error in video collect: {e}",
@@ -1766,11 +2056,21 @@ class VideoCollectProcessor(BaseProcessor):
                     extra={"model": self.model},
                 )
                 raise
+            _log_video_stream_end(
+                stage="collect",
+                reason="upstream_exception",
+                extra=f"error={e}, fallback_video_id={fallback_video_id or '-'}",
+            )
             logger.error(
                 f"Video collect upstream error: {e}",
                 extra={"model": self.model, "error_type": type(e).__name__},
             )
         except Exception as e:
+            _log_video_stream_end(
+                stage="collect",
+                reason="exception",
+                extra=f"type={type(e).__name__}, error={e}, fallback_video_id={fallback_video_id or '-'}",
+            )
             logger.error(
                 f"Video collect processing error: {e}",
                 extra={"model": self.model, "error_type": type(e).__name__},

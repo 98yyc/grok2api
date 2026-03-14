@@ -209,17 +209,57 @@
     if (editExtendPostId) editExtendPostId.textContent = shortHash(currentExtendPostId);
   }
 
+  const UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+
   // 从缓存视频文件名中提取 parentPostId
   // 文件名格式示例: users-xxx-generated-{postId}-generated_video_hd.mp4
   function extractPostIdFromFileName(name) {
     const s = String(name || '').trim();
     if (!s) return '';
     // 尝试 generated-{uuid}- 模式
-    const m = s.match(/generated-([0-9a-fA-F-]{32,36})-/);
+    const m = s.match(/generated-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-/);
     if (m) return m[1];
     // 回退：匹配最后一个 UUID 格式
-    const allUuids = s.match(/[0-9a-fA-F-]{32,36}/g);
+    const allUuids = s.match(UUID_RE);
     return allUuids && allUuids.length ? allUuids[allUuids.length - 1] : '';
+  }
+
+  function extractPostIdFromShareLink(link) {
+    const text = String(link || '').trim();
+    if (!text) return '';
+    const match = text.match(/\/imagine\/post\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:[/?#]|$)/i);
+    return match ? match[1] : '';
+  }
+
+  function resolveVideoPostId(meta = {}) {
+    const directPostId = String(meta.postId || meta.post_id || '').trim();
+    if (directPostId) return directPostId;
+    const shareLinkPostId = extractPostIdFromShareLink(meta.shareLink || meta.share_link || '');
+    if (shareLinkPostId) return shareLinkPostId;
+    const originalPostId = String(meta.originalPostId || meta.original_post_id || '').trim();
+    if (originalPostId) return originalPostId;
+    const namePostId = extractPostIdFromFileName(meta.name || '');
+    if (namePostId) return namePostId;
+    return extractPostIdFromFileName(meta.url || '');
+  }
+
+  function applyResolvedVideoIdentity(meta = {}, sourceLabel = '') {
+    const resolvedPostId = resolveVideoPostId(meta);
+    if (!resolvedPostId) {
+      if (sourceLabel) {
+        console.warn(`[视频标识] ${sourceLabel} 未解析到 post_id`, meta);
+      }
+      return '';
+    }
+    currentExtendPostId = resolvedPostId;
+    currentFileAttachmentId = resolvedPostId;
+    if (!originalFileAttachmentId) {
+      originalFileAttachmentId = resolvedPostId;
+    }
+    if (sourceLabel) {
+      console.log(`[视频标识] ${sourceLabel} 解析 post_id:`, resolvedPostId);
+    }
+    return resolvedPostId;
   }
 
   function debugLog(...args) {
@@ -1570,24 +1610,13 @@
     });
   }
 
-  function bindEditVideoSource(url) {
+  function bindEditVideoSource(url, meta = {}) {
     const safeUrl = String(url || '').trim();
     selectedVideoUrl = safeUrl;
     if (editHint) {
       editHint.classList.toggle('hidden', Boolean(safeUrl));
     }
-    // 从 URL 中提取 postId （支持历史面板点击编辑）
-    const postId = extractPostIdFromFileName(safeUrl);
-    if (postId) {
-      currentExtendPostId = postId;
-      currentFileAttachmentId = postId;
-      // 首次设置 originalFileAttachmentId（后续延长不覆盖）
-      if (!originalFileAttachmentId) {
-        originalFileAttachmentId = postId;
-        debugLog('bindEditVideoSource: set originalFileAttachmentId =', postId);
-      }
-      debugLog('bindEditVideoSource: extracted postId =', postId);
-    }
+    applyResolvedVideoIdentity({ ...meta, url: safeUrl }, 'bindEditVideoSource');
     if (!editVideo) return;
     enforceInlinePlayback(editVideo);
     editVideo.src = safeUrl;
@@ -1617,7 +1646,12 @@
     }
     if (editHint) editHint.classList.add('hidden');
     if (editBody) editBody.classList.remove('hidden');
-    bindEditVideoSource(url);
+    bindEditVideoSource(url, item ? {
+      postId: item.dataset.postId || '',
+      shareLink: item.dataset.shareLink || '',
+      originalPostId: item.dataset.originalPostId || '',
+      name: item.dataset.name || '',
+    } : {});
   }
 
   function closeEditPanel() {
@@ -1747,9 +1781,12 @@
     const html = items.map((item, idx) => {
       const name = String(item.name || '');
       const url = String(item.view_url || '');
+      const postId = String(item.post_id || '');
+      const shareLink = String(item.share_link || '');
+      const originalPostId = String(item.original_post_id || '');
       const size = formatBytes(item.size_bytes);
       const mtime = formatMtime(item.mtime_ms);
-      return `<div class="cache-video-item" data-url="${url}" data-name="${name}">
+      return `<div class="cache-video-item" data-url="${url}" data-name="${name}" data-post-id="${postId}" data-share-link="${shareLink}" data-original-post-id="${originalPostId}">
         <div class="cache-video-thumb-wrap">
           <video class="cache-video-thumb" src="${url}" preload="auto" muted playsinline></video>
         </div>
@@ -1788,25 +1825,20 @@
     }
   }
 
-  function useCachedVideo(url, name) {
+  function useCachedVideo(url, name, meta = {}) {
     const safeUrl = String(url || '').trim();
     if (!safeUrl) return;
     selectedVideoItemId = `cache-${Date.now()}`;
     selectedVideoUrl = safeUrl;
-    // 从文件名中自动提取 parentPostId 用于视频延长
-    const extractedPostId = extractPostIdFromFileName(String(name || ''));
-    if (extractedPostId) {
-      currentExtendPostId = extractedPostId;
-      currentFileAttachmentId = extractedPostId;
-      // 从缓存重新选择视频时重置 originalFileAttachmentId（开启新的延长链）
-      originalFileAttachmentId = extractedPostId;
-      debugLog('useCachedVideo: extracted postId =', extractedPostId);
-    }
+    originalFileAttachmentId = '';
+    applyResolvedVideoIdentity({ ...meta, name, url: safeUrl }, 'useCachedVideo');
     if (imageUrlInput) imageUrlInput.value = safeUrl;
     if (imageFileName && name) imageFileName.textContent = name;
     if (enterEditBtn) enterEditBtn.disabled = false;
     closeCacheVideoModal();
-    openEditPanel();
+    bindEditVideoSource(safeUrl, { ...meta, name });
+    if (editHint) editHint.classList.add('hidden');
+    if (editBody) editBody.classList.remove('hidden');
     setEditMeta();
   }
 
@@ -2404,11 +2436,12 @@
                     editVideo.src = videoUrl;
                     editVideo.load();
                   }
-                  // 从新视频 URL 提取 postId 用于链式延长
-                  const newPostId = extractPostIdFromFileName(videoUrl);
+                  // 优先从 create-link 元数据对应的 post_id，最后才回退到 URL
+                  const newPostId = applyResolvedVideoIdentity({ url: videoUrl }, 'extend-sse');
                   if (newPostId) {
-                    currentExtendPostId = newPostId;  // 更新当前 postId
-                    currentFileAttachmentId = newPostId;
+                    if (item) {
+                      item.dataset.postId = newPostId;
+                    }
                     console.log('[SSE 调试] 从新视频成功提取到新的 extend_post_id:', newPostId);
                   } else {
                     console.warn('[SSE 调试] 未能从新视频地址提取出新的 extend_post_id!', videoUrl);
@@ -2708,7 +2741,11 @@
       if (!target.classList.contains('cache-video-use')) return;
       const row = target.closest('.cache-video-item');
       if (!row) return;
-      useCachedVideo(row.getAttribute('data-url') || '', row.getAttribute('data-name') || '');
+      useCachedVideo(row.getAttribute('data-url') || '', row.getAttribute('data-name') || '', {
+        postId: row.getAttribute('data-post-id') || '',
+        shareLink: row.getAttribute('data-share-link') || '',
+        originalPostId: row.getAttribute('data-original-post-id') || '',
+      });
     });
   }
 
@@ -2726,7 +2763,13 @@
           return;
         }
         // 提取 postId 用于延长
-        const postId = extractPostIdFromFileName(bUrl);
+        const postId = resolveVideoPostId({
+          postId: item.dataset.postId || '',
+          shareLink: item.dataset.shareLink || '',
+          originalPostId: item.dataset.originalPostId || '',
+          name: item.dataset.name || '',
+          url: bUrl,
+        });
         if (postId) {
           currentExtendPostId = postId;
           currentFileAttachmentId = postId;
@@ -2750,7 +2793,12 @@
         return;
       }
       if (!target.classList.contains('video-download')) {
-        bindEditVideoSource(selectedVideoUrl);
+        bindEditVideoSource(selectedVideoUrl, {
+          postId: item.dataset.postId || '',
+          shareLink: item.dataset.shareLink || '',
+          originalPostId: item.dataset.originalPostId || '',
+          name: item.dataset.name || '',
+        });
         return;
       }
       event.preventDefault();
