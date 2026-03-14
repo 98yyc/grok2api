@@ -498,6 +498,44 @@
     titleEl.textContent = customTitle || baseTitle || '视频';
   }
 
+  function syncCachedVideoDisplayName(meta = {}, displayName = '') {
+    if (!cacheVideoList) return;
+    const resolvedPostId = resolveVideoPostId(meta);
+    const resolvedUrl = String(meta.url || '').trim();
+    const rows = cacheVideoList.querySelectorAll('.cache-video-item');
+    rows.forEach((row) => {
+      const rowPostId = String(row.getAttribute('data-post-id') || '').trim();
+      const rowUrl = String(row.getAttribute('data-url') || '').trim();
+      const matched = (resolvedPostId && rowPostId === resolvedPostId)
+        || (resolvedUrl && rowUrl === resolvedUrl);
+      if (!matched) return;
+      row.setAttribute('data-display-name', String(displayName || '').trim());
+      const nameEl = row.querySelector('.cache-video-name');
+      if (nameEl) {
+        const fallbackName = String(row.getAttribute('data-name') || '').trim() || 'video.mp4';
+        nameEl.textContent = String(displayName || '').trim() || fallbackName;
+      }
+    });
+  }
+
+  function applyRenamedVideoState(meta = {}, displayName = '') {
+    const nextDisplayName = String(displayName || '').trim();
+    if (meta.item) {
+      meta.item.dataset.displayName = nextDisplayName;
+      applyVideoCardTitle(meta.item);
+    }
+    if (selectedVideoUrl && String(meta.url || '').trim() === String(selectedVideoUrl || '').trim()) {
+      selectedVideoMeta.displayName = nextDisplayName;
+      if (!nextDisplayName) {
+        selectedVideoMeta.defaultTitle = String(meta.name || selectedVideoMeta.name || selectedVideoMeta.defaultTitle || '').trim();
+      } else if (!selectedVideoMeta.defaultTitle) {
+        selectedVideoMeta.defaultTitle = String(meta.name || selectedVideoMeta.name || '').trim();
+      }
+      setEditMeta();
+    }
+    syncCachedVideoDisplayName(meta, nextDisplayName);
+  }
+
   function applyResolvedVideoIdentity(meta = {}, sourceLabel = '') {
     const resolvedPostId = resolveVideoPostId(meta);
     if (!resolvedPostId) {
@@ -2137,7 +2175,7 @@
       ...meta,
       name,
       displayName: String(meta.displayName || '').trim(),
-      defaultTitle: String(meta.displayName || name || '').trim(),
+      defaultTitle: String(name || '').trim(),
     });
     if (editHint) editHint.classList.add('hidden');
     if (editBody) editBody.classList.remove('hidden');
@@ -2921,11 +2959,7 @@
           name: meta.name,
           url: meta.url,
         }, safeTitle);
-        if (meta.item) {
-          meta.item.dataset.displayName = String(result.display_name || '');
-          applyVideoCardTitle(meta.item);
-        }
-        setEditMeta();
+        applyRenamedVideoState(meta, String(result.display_name || ''));
         toast(safeTitle ? '已更新视频名称' : '已恢复默认名称', 'success');
       } catch (error) {
         console.warn('[工作区视频重命名] 保存失败', {
@@ -3110,6 +3144,7 @@
         postId: row.getAttribute('data-post-id') || '',
         shareLink: row.getAttribute('data-share-link') || '',
         originalPostId: row.getAttribute('data-original-post-id') || '',
+        displayName: row.getAttribute('data-display-name') || '',
       });
     });
   }
@@ -3171,7 +3206,14 @@
               name: item.dataset.name || '',
               url: item.dataset.url || '',
             }, safeTitle);
-            item.dataset.displayName = String(result.display_name || '');
+            applyRenamedVideoState({
+              item,
+              postId: item.dataset.postId || '',
+              shareLink: item.dataset.shareLink || '',
+              originalPostId: item.dataset.originalPostId || '',
+              name: item.dataset.name || '',
+              url: item.dataset.url || '',
+            }, String(result.display_name || ''));
           } catch (error) {
             console.warn('[视频重命名] 保存失败', {
               error: String(error && error.message ? error.message : error || ''),
@@ -3184,7 +3226,6 @@
             toast('视频名称保存失败', 'error');
             return;
           }
-          applyVideoCardTitle(item);
           toast(safeTitle ? '已更新视频名称' : '已恢复默认名称', 'success');
           return;
         }
